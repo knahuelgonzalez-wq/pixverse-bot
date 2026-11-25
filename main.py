@@ -1,168 +1,393 @@
 import os
 import uuid
 import time
+import asyncio
+import tempfile
+import logging
 import requests
+
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# ======================
-# PASTE YOUR KEYS HERE
-# ======================
-TELEGRAM_TOKEN = "8590501788:AAGNfPEJ3yyqo9MCK-mnnhumvqDOT7AUhWo"
-PIXVERSE_API_KEY = "sk-dd7473dfee8a62e5d160297349295274"
+# ==========================================
+# LITTLE ORBIT STUDIOS - TELEGRAM BOT
+# ==========================================
 
-# PixVerse settings
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+# Credentials come from Railway Variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+PIXVERSE_API_KEY = os.getenv("PIXVERSE_API_KEY")
+
+# PixVerse configuration
 BASE_URL = "https://app-api.pixverse.ai"
-MODEL = "v6" # you can change to "v6-max" later if you want
-DURATION = 5 # seconds (5, 8 or 10 recommended)
+MODEL = "v6"
+DURATION = 5
 QUALITY = "720p"
 ASPECT_RATIO = "16:9"
 
-# ======================
-# Helper functions
-# ======================
+MAX_WAIT = 600
+POLL_INTERVAL = 5
+
+# ==========================================
+# STARTUP CHECK
+# ==========================================
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is missing!")
+
+if not PIXVERSE_API_KEY:
+    raise RuntimeError("PIXVERSE_API_KEY is missing!")
+
+
+# ==========================================
+# PIXVERSE API FUNCTIONS
+# ==========================================
 
 def get_headers():
-return {
-"API-KEY": PIXVERSE_API_KEY,
-"Ai-trace-id": str(uuid.uuid4()),
-"Content-Type": "application/json"
-}
+    return {
+        "API-KEY": PIXVERSE_API_KEY,
+        "Ai-trace-id": str(uuid.uuid4()),
+    }
 
-def upload_image(image_path: str):
-"""Upload image to PixVerse and return img_id"""
-url = f"{BASE_URL}/openapi/v2/image/upload"
-headers = {
-"API-KEY": PIXVERSE_API_KEY,
-"Ai-trace-id": str(uuid.uuid4())
-}
-with open(image_path, "rb") as f:
-files = {"file": f}
-response = requests.post(url, headers=headers, files=files)
 
-data = response.json()
-if data.get("ErrCode") != 0:
-raise Exception(f"Image upload failed: {data.get('ErrMsg')}")
+def api_request(method, endpoint, **kwargs):
+    url = f"{BASE_URL}{endpoint}"
 
-return data["Resp"]["img_id"]
+    response = requests.request(
+        method,
+        url,
+        headers=get_headers(),
+        timeout=60,
+        **kwargs,
+    )
 
-def create_text_video(prompt: str):
-"""Create video from text only"""
-url = f"{BASE_URL}/openapi/v2/video/text/generate"
-payload = {
-"model": MODEL,
-"prompt": prompt,
-"duration": DURATION,
-"quality": QUALITY,
-"aspect_ratio": ASPECT_RATIO,
-"generate_audio_switch": False
-}
-response = requests.post(url, headers=get_headers(), json=payload)
-data = response.json()
+    response.raise_for_status()
 
-if data.get("ErrCode") != 0:
-raise Exception(f"Failed to create video: {data.get('ErrMsg')}")
+    try:
+        data = response.json()
+    except ValueError:
+        raise Exception("PixVerse returned an invalid response.")
 
-return data["Resp"]["video_id"]
+    if data.get("ErrCode") != 0:
+        raise Exception(
+            f"PixVerse error: {data.get('ErrMsg', 'Unknown error')}"
+        )
 
-def create_image_video(prompt: str, img_id: int):
-"""Create video from image + prompt"""
-url = f"{BASE_URL}/openapi/v2/video/img/generate"
-payload = {
-"model": MODEL,
-"prompt": prompt,
-"img_id": img_id,
-"duration": DURATION,
-"quality": QUALITY,
-"generate_audio_switch": False
-}
-response = requests.post(url, headers=get_headers(), json=payload)
-data = response.json()
+    return data.get("Resp", {})
 
-if data.get("ErrCode") != 0:
-raise Exception(f"Failed to create video: {data.get('ErrMsg')}")
 
-return data["Resp"]["video_id"]
+# ==========================================
+# IMAGE UPLOAD
+# ==========================================
 
-def wait_for_video(video_id: int, max_wait=180):
-"""Poll until the video is ready"""
-url = f"{BASE_URL}/openapi/v2/video/result/{video_id}"
+def upload_image(image_path):
 
-for _ in range(max_wait // 5):
-headers = get_headers()
-response = requests.get(url, headers=headers)
-data = response.json()
+    with open(image_path, "rb") as image:
 
-if data.get("ErrCode") != 0:
-raise Exception(f"Error checking status: {data.get('ErrMsg')}")
+        response = requests.post(
+            f"{BASE_URL}/openapi/v2/image/upload",
+            headers=get_headers(),
+            files={
+                "image": (
+                    "reference.jpg",
+                    image,
+                    "image/jpeg",
+                )
+            },
+            timeout=120,
+        )
 
-status = data["Resp"].get("status")
+    response.raise_for_status()
 
-if status == 1: # completed
-return data["Resp"]["url"]
-elif status in [7, 8]: # failed
-raise Exception("Video generation failed")
+    data = response.json()
 
-time.sleep(5)
+    if data.get("ErrCode") != 0:
+        raise Exception(
+            f"Image upload failed: {data.get('ErrMsg')}"
+        )
 
-raise Exception("Timeout waiting for video")
+    return data["Resp"]["img_id"]
 
-# ======================
-# Telegram handlers
-# ======================
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-message = update.message
-if not message:
-return
+# ==========================================
+# TEXT TO VIDEO
+# ==========================================
 
-status_msg = await message.reply_text("Generating your clip... please wait ⏳")
+def create_text_video(prompt):
 
-try:
-# Case 1: User sent a photo + caption
-if message.photo:
-prompt = message.caption or "Animate this image"
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "duration": DURATION,
+        "quality": QUALITY,
+        "aspect_ratio": ASPECT_RATIO,
+        "generate_audio_switch": False,
+    }
 
-# Download the photo
-photo_file = await message.photo[-1].get_file()
-photo_path = f"/tmp/{uuid.uuid4()}.jpg"
-await photo_file.download_to_drive(photo_path)
+    result = api_request(
+        "POST",
+        "/openapi/v2/video/text/generate",
+        json=payload,
+    )
 
-# Upload to PixVerse
-img_id = upload_image(photo_path)
-video_id = create_image_video(prompt, img_id)
+    return result["video_id"]
 
-# Clean up
-os.remove(photo_path)
 
-# Case 2: User sent only text
-else:
-prompt = message.text
-if not prompt:
-await status_msg.edit_text("Please send a text prompt or a photo with caption.")
-return
-video_id = create_text_video(prompt)
+# ==========================================
+# IMAGE TO VIDEO
+# ==========================================
 
-# Wait for the video
-video_url = wait_for_video(video_id)
+def create_image_video(prompt, img_id):
 
-# Send the finished video
-await status_msg.edit_text("Clip ready! Sending...")
-await message.reply_video(video=video_url, caption="Here’s your clip 🎬")
-await status_msg.delete()
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "img_id": img_id,
+        "duration": DURATION,
+        "quality": QUALITY,
+        "generate_audio_switch": False,
+    }
 
-except Exception as e:
-await status_msg.edit_text(f"Error: {str(e)}")
+    result = api_request(
+        "POST",
+        "/openapi/v2/video/img/generate",
+        json=payload,
+    )
 
-# ======================
-# Start the bot
-# ======================
+    return result["video_id"]
+
+
+# ==========================================
+# CHECK VIDEO STATUS
+# ==========================================
+
+def wait_for_video(video_id):
+
+    endpoint = f"/openapi/v2/video/result/{video_id}"
+
+    deadline = time.monotonic() + MAX_WAIT
+
+    while time.monotonic() < deadline:
+
+        result = api_request(
+            "GET",
+            endpoint,
+        )
+
+        status = result.get("status")
+
+        if status == 1:
+
+            video_url = result.get("url")
+
+            if not video_url:
+                raise Exception(
+                    "Video finished but PixVerse returned no URL."
+                )
+
+            return video_url
+
+        elif status == 7:
+            raise Exception(
+                "Video was rejected by PixVerse moderation."
+            )
+
+        elif status == 8:
+            raise Exception(
+                "PixVerse could not generate this video."
+            )
+
+        logger.info(
+            "Video %s status: %s",
+            video_id,
+            status,
+        )
+
+        time.sleep(POLL_INTERVAL)
+
+    raise Exception(
+        "Video generation timed out. Check PixVerse task status."
+    )
+
+
+# ==========================================
+# TELEGRAM MESSAGE HANDLER
+# ==========================================
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    message = update.effective_message
+
+    if not message:
+        return
+
+    status_message = await message.reply_text(
+        "🌙 Little Orbit Studios\n\n"
+        "Preparing your animation... 🎬"
+    )
+
+    image_path = None
+
+    try:
+
+        # IMAGE + PROMPT
+        if message.photo:
+
+            prompt = (
+                message.caption
+                or "Animate this image naturally while preserving its original appearance."
+            )
+
+            await status_message.edit_text(
+                "🖼️ Downloading your reference image..."
+            )
+
+            photo = await message.photo[-1].get_file()
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".jpg",
+                delete=False,
+            ) as temp:
+
+                image_path = temp.name
+
+            await photo.download_to_drive(image_path)
+
+            await status_message.edit_text(
+                "📤 Uploading reference to PixVerse..."
+            )
+
+            img_id = await asyncio.to_thread(
+                upload_image,
+                image_path,
+            )
+
+            await status_message.edit_text(
+                "🎥 Creating your animation..."
+            )
+
+            video_id = await asyncio.to_thread(
+                create_image_video,
+                prompt,
+                img_id,
+            )
+
+        # TEXT ONLY
+        elif message.text:
+
+            prompt = message.text.strip()
+
+            if not prompt:
+                await status_message.edit_text(
+                    "Please send a video prompt."
+                )
+                return
+
+            await status_message.edit_text(
+                "✨ Creating your video from text..."
+            )
+
+            video_id = await asyncio.to_thread(
+                create_text_video,
+                prompt,
+            )
+
+        else:
+
+            await status_message.edit_text(
+                "Please send a photo with a caption or a text prompt."
+            )
+            return
+
+        # WAIT FOR GENERATION
+        await status_message.edit_text(
+            f"🚀 Video submitted!\n\n"
+            f"Task ID: {video_id}\n\n"
+            f"PixVerse is rendering your scene..."
+        )
+
+        video_url = await asyncio.to_thread(
+            wait_for_video,
+            video_id,
+        )
+
+        # SEND FINISHED VIDEO
+        await status_message.edit_text(
+            "🎉 Your animation is ready! Sending it now..."
+        )
+
+        await message.reply_video(
+            video=video_url,
+            caption="🌙 Little Orbit Studios | Animation complete",
+            read_timeout=180,
+            write_timeout=180,
+            connect_timeout=30,
+        )
+
+        await status_message.delete()
+
+    except Exception as error:
+
+        logger.exception("Video generation failed")
+
+        try:
+            await status_message.edit_text(
+                "❌ Something went wrong.\n\n"
+                f"{str(error)[:700]}\n\n"
+                "Please check your Railway logs if this continues."
+            )
+        except Exception:
+            logger.exception("Could not send error message")
+
+    finally:
+
+        if image_path and os.path.exists(image_path):
+
+            try:
+                os.remove(image_path)
+            except OSError:
+                logger.warning("Could not remove temporary image")
+
+
+# ==========================================
+# BOT STARTUP
+# ==========================================
 
 def main():
-app = Application.builder().token(TELEGRAM_TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
-print("Bot is running...")
-app.run_polling()
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT | filters.PHOTO,
+            handle_message,
+        )
+    )
+
+    logger.info(
+        "Little Orbit Studios bot is starting..."
+    )
+
+    app.run_polling()
+
 
 if __name__ == "__main__":
-main()
+    main()
